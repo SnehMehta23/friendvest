@@ -1,6 +1,7 @@
 <!-- pages/index.vue -->
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
+import { useDebounceFn } from '@vueuse/core'
 import { TrendingUp, Trophy, Wallet, Plus, X, Users } from 'lucide-vue-next'
 import { createClient } from '@supabase/supabase-js'
 
@@ -9,27 +10,38 @@ const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 const supabase = createClient(supabaseUrl, supabaseKey)
 
 // Types
+
+interface SymbolValidation {
+  isValid: boolean
+  isChecking: boolean
+  error?: string
+}
+
 interface Holding {
   symbol: string
-  value: number
-  returns: number
+  shares: number
+  avgCost: number
+  currentPrice?: number
+  value?: number
+  returns?: number
 }
 
 interface Portfolio {
   id: number
   name: string
   avatar_initials: string
-  portfolio_value: number
-  returns: number
   holdings: Holding[]
+  created_at: string
+  portfolio_value: number     // Matches your table
+  returns: number            // Matches your table (not total_returns)
 }
 
 interface NewPortfolio {
   name: string
   holdings: Array<{
     symbol: string
-    value: string | number
-    returns: string | number
+    shares: string | number
+    avgCost: string | number
   }>
 }
 
@@ -38,20 +50,25 @@ const users = ref<Portfolio[]>([])
 const selectedUser = ref<Portfolio | null>(null)
 const showOnboarding = ref(true)
 const loading = ref(true)
+const symbolValidations = ref<Record<number, SymbolValidation>>({})
+const { getStockPrice, validateSymbol } = useTwelveData()
 const newPortfolio = ref<NewPortfolio>({
   name: "",
-  holdings: [{ symbol: "", value: "", returns: "" }]
+  holdings: [{ symbol: "", shares: "", avgCost: "" }] // New structure
 })
 
 const isFormValid = computed(() => {
   if (!newPortfolio.value.name) return false
-  
-  return newPortfolio.value.holdings.every(h => 
-    h.symbol.trim() !== '' && 
-    h.value !== '' && 
-    !isNaN(Number(h.value)) && 
-    h.returns !== '' && 
-    !isNaN(Number(h.returns))
+
+  return newPortfolio.value.holdings.every((h, index) =>
+    h.symbol.trim() !== '' &&
+    symbolValidations.value[index]?.isValid &&
+    h.shares !== '' &&
+    !isNaN(Number(h.shares)) &&
+    Number(h.shares) > 0 &&
+    h.avgCost !== '' &&
+    !isNaN(Number(h.avgCost)) &&
+    Number(h.avgCost) > 0
   )
 })
 
@@ -62,9 +79,9 @@ const fetchUsers = async () => {
       .from('portfolios')
       .select('*')
       .order('returns', { ascending: false })
-    
+
     if (error) throw error
-    
+
     users.value = data
     if (data.length > 0) {
       selectedUser.value = data[0]
@@ -76,6 +93,30 @@ const fetchUsers = async () => {
   }
 }
 
+const validateHoldingSymbol = useDebounceFn(async (symbol: string, index: number) => {
+  if (!symbol.trim()) {
+    symbolValidations.value[index] = { isValid: false, isChecking: false }
+    return
+  }
+
+  symbolValidations.value[index] = { isValid: false, isChecking: true }
+
+  try {
+    const isValid = await validateSymbol(symbol)
+    symbolValidations.value[index] = {
+      isValid,
+      isChecking: false,
+      error: isValid ? undefined : 'Invalid symbol'
+    }
+  } catch (error) {
+    symbolValidations.value[index] = {
+      isValid: false,
+      isChecking: false,
+      error: 'Error checking symbol'
+    }
+  }
+}, 500)
+
 const addHolding = () => {
   newPortfolio.value.holdings.push({ symbol: "", value: "", returns: "" })
 }
@@ -84,33 +125,67 @@ const removeHolding = (index: number) => {
   newPortfolio.value.holdings = newPortfolio.value.holdings.filter((_, i) => i !== index)
 }
 
+const calculatePortfolioTotals = (holdings: Holding[]) => {
+  const totalCost = holdings.reduce((sum, h) => sum + (h.shares * h.avgCost), 0)
+  const currentValue = holdings.reduce((sum, h) => sum + (h.shares * (h.currentPrice || h.avgCost)), 0)
+  const totalReturns = totalCost > 0 ? ((currentValue - totalCost) / totalCost) * 100 : 0
+
+  return {
+    portfolio_value: currentValue,
+    returns: totalReturns
+  }
+}
+
 const handleNewPortfolioSubmit = async () => {
   try {
     loading.value = true
-    
-    const portfolioValue = newPortfolio.value.holdings.reduce((sum, holding) => {
-      const value = parseFloat(String(holding.value).replace(/[^\d.-]/g, '')) || 0
-      return sum + value
-    }, 0)
-    
-    const avgReturns = newPortfolio.value.holdings.reduce((sum, holding) => {
-      const returns = parseFloat(String(holding.returns).replace(/[^\d.-]/g, '')) || 0
-      return sum + returns
-    }, 0) / newPortfolio.value.holdings.length
+
+    // Fetch current prices for all holdings
+    const holdingsWithPrices = await Promise.all(
+      newPortfolio.value.holdings.map(async h => {
+        const currentPrice = await getStockPrice(h.symbol)
+        const shares = parseFloat(String(h.shares))
+        const avgCost = parseFloat(String(h.avgCost))
+        const value = shares * currentPrice
+        const returns = ((currentPrice - avgCost) / avgCost) * 100
+
+        return {
+          symbol: h.symbol.toUpperCase(),
+          shares,
+          avgCost,
+          currentPrice,
+          value,
+          returns
+        }
+      })
+    )
+
+    const { portfolio_value, returns } = calculatePortfolioTotals(holdingsWithPrices)
 
     const newUser = {
       name: newPortfolio.value.name,
       avatar_initials: newPortfolio.value.name.split(' ').map(n => n[0]).join(''),
-      portfolio_value: portfolioValue,
-      returns: avgReturns,
-      holdings: newPortfolio.value.holdings.map(h => ({
-        symbol: h.symbol,
-        value: parseFloat(String(h.value).replace(/[^\d.-]/g, '')) || 0,
-        returns: parseFloat(String(h.returns).replace(/[^\d.-]/g, '')) || 0
-      }))
+      holdings: holdingsWithPrices,
+      portfolio_value,
+      returns
     }
 
-    // Rest of the function remains the same...
+    const { data, error } = await supabase
+      .from('portfolios')
+      .insert([newUser])
+      .select()
+
+    if (error) throw error
+
+    if (data) {
+      users.value = [...users.value, data[0]]
+      selectedUser.value = data[0]
+      newPortfolio.value = {
+        name: "",
+        holdings: [{ symbol: "", shares: "", avgCost: "" }]
+      }
+      symbolValidations.value = {}
+    }
   } catch (error) {
     console.error('Error adding portfolio:', error)
   } finally {
@@ -134,7 +209,7 @@ onMounted(() => {
         </UiDialogHeader>
         <div class="space-y-4">
           <p>Track and compare investments with your friends in a fun, social way!</p>
-          
+
           <div class="space-y-2">
             <h3 class="font-semibold">How it works:</h3>
             <ul class="list-disc pl-4 space-y-1">
@@ -187,57 +262,67 @@ onMounted(() => {
                   <Plus class="h-4 w-4" />
                 </UiButton>
               </UiDialogTrigger>
-              <UiDialogContent class="sm:max-w-[425px]">
-                <UiDialogHeader>
+              <UiDialogContent class="sm:max-w-[425px] max-h-[80vh] flex flex-col">
+                <UiDialogHeader class="flex-shrink-0">
                   <UiDialogTitle>Add Your Portfolio</UiDialogTitle>
                 </UiDialogHeader>
-                <div class="space-y-4">
-                  <div>
-                    <UiLabel for="name">Name</UiLabel>
-                    <UiInput
-                      id="name"
-                      v-model="newPortfolio.name"
-                    />
-                  </div>
-                  <div v-for="(holding, index) in newPortfolio.holdings" :key="index" class="space-y-2 p-2 bg-gray-50 rounded-lg">
-                    <div class="flex justify-between items-center">
-                      <UiLabel>Holding {{ index + 1 }}</UiLabel>
-                      <UiButton 
-                        v-if="index > 0"
-                        variant="ghost" 
-                        size="icon"
-                        @click="removeHolding(index)"
-                      >
-                        <X class="h-4 w-4" />
-                      </UiButton>
+
+                <!-- Scrollable content -->
+                <div class="flex-1 overflow-y-auto pr-2">
+                  <div class="space-y-4">
+                    <div>
+                      <UiLabel for="name">Name</UiLabel>
+                      <UiInput id="name" v-model="newPortfolio.name" />
                     </div>
-                    <UiInput
-                      v-model="holding.symbol"
-                      placeholder="Symbol (e.g., AAPL)"
-                    />
-                    <UiInput
-                      v-model="holding.value"
-                      type="text"
-                      inputmode="decimal"
-                      pattern="[0-9]*"
-                      placeholder="Value ($)"
-                    />
-                    <UiInput
-                      v-model="holding.returns"
-                      type="text"
-                      inputmode="decimal"
-                      pattern="[0-9]*"
-                      placeholder="Returns (%)"
-                    />
+                    <div v-for="(holding, index) in newPortfolio.holdings" :key="index"
+                      class="space-y-2 p-2 bg-gray-50 rounded-lg">
+                      <div class="flex justify-between items-center">
+                        <UiLabel>Position {{ index + 1 }}</UiLabel>
+                        <UiButton v-if="index > 0" variant="ghost" size="icon" @click="removeHolding(index)">
+                          <X class="h-4 w-4" />
+                        </UiButton>
+                      </div>
+
+                      <!-- Symbol Input -->
+                      <div class="space-y-1">
+                        <UiLabel>Symbol</UiLabel>
+                        <div class="relative">
+                          <UiInput v-model="holding.symbol" placeholder="AAPL" class="uppercase" :class="{
+                            'pr-8': symbolValidations[index]?.isChecking,
+                            'border-red-500': symbolValidations[index]?.error
+                          }" @input="() => validateHoldingSymbol(holding.symbol, index)" />
+                          <div v-if="symbolValidations[index]?.isChecking"
+                            class="absolute right-2 top-1/2 -translate-y-1/2">
+                            <div
+                              class="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />
+                          </div>
+                        </div>
+                        <p v-if="symbolValidations[index]?.error" class="text-sm text-red-500">
+                          {{ symbolValidations[index].error }}
+                        </p>
+                      </div>
+
+                      <!-- Shares Input -->
+                      <div class="space-y-1">
+                        <UiLabel>Number of Shares</UiLabel>
+                        <UiInput v-model="holding.shares" type="text" inputmode="decimal" placeholder="100" />
+                      </div>
+
+                      <!-- Average Cost Input -->
+                      <div class="space-y-1">
+                        <UiLabel>Average Cost per Share</UiLabel>
+                        <UiInput v-model="holding.avgCost" type="text" inputmode="decimal" placeholder="150.00" />
+                      </div>
+                    </div>
+                    <UiButton variant="outline" @click="addHolding">
+                      Add Another Holding
+                    </UiButton>
                   </div>
-                  <UiButton variant="outline" @click="addHolding">
-                    Add Another Holding
-                  </UiButton>
-                  <UiButton 
-                    class="w-full" 
-                    @click="handleNewPortfolioSubmit"
-                    :disabled="!isFormValid"
-                  >
+                </div>
+
+                <!-- Footer with submit button -->
+                <div class="flex-shrink-0 pt-4 mt-4 border-t">
+                  <UiButton class="w-full" @click="handleNewPortfolioSubmit" :disabled="!isFormValid">
                     Add Portfolio
                   </UiButton>
                 </div>
@@ -250,13 +335,10 @@ onMounted(() => {
             Loading...
           </div>
           <div v-else class="space-y-2">
-            <div 
-              v-for="(user, index) in users" 
-              :key="user.id"
+            <div v-for="(user, index) in users" :key="user.id"
               class="flex items-center justify-between p-3 rounded-lg cursor-pointer transition-colors"
               :class="selectedUser?.id === user.id ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'"
-              @click="selectedUser = user"
-            >
+              @click="selectedUser = user">
               <div class="flex items-center gap-3">
                 <UiAvatar class="h-8 w-8">
                   <UiAvatarFallback>{{ user.avatar_initials }}</UiAvatarFallback>
@@ -281,7 +363,8 @@ onMounted(() => {
             </UiAvatar>
             <div>
               <UiCardTitle>{{ selectedUser.name }}'s Portfolio</UiCardTitle>
-              <p class="text-sm text-gray-500">Last updated {{ new Date(selectedUser.created_at).toLocaleDateString() }}</p>
+              <p class="text-sm text-gray-500">Last updated {{ new Date(selectedUser.created_at).toLocaleDateString() }}
+              </p>
             </div>
           </div>
         </UiCardHeader>
@@ -290,32 +373,42 @@ onMounted(() => {
             <UiCard>
               <UiCardContent class="pt-6">
                 <div class="text-sm text-gray-500">Portfolio Value</div>
-                <div class="text-2xl font-bold">${{ selectedUser.portfolio_value.toLocaleString() }}</div>
+                <div class="text-2xl font-bold">
+                  ${{ selectedUser.portfolio_value?.toLocaleString() ?? '0' }}
+                </div>
               </UiCardContent>
             </UiCard>
             <UiCard>
               <UiCardContent class="pt-6">
                 <div class="text-sm text-gray-500">Total Returns</div>
-                <div class="text-2xl font-bold text-green-600">+{{ selectedUser.returns.toFixed(1) }}%</div>
+                <div class="text-2xl font-bold"
+                  :class="(selectedUser.returns ?? 0) >= 0 ? 'text-green-600' : 'text-red-600'">
+                  {{ (selectedUser.returns ?? 0) >= 0 ? '+' : '' }}{{ (selectedUser.returns ?? 0).toFixed(1)
+                  }}%
+                </div>
               </UiCardContent>
             </UiCard>
           </div>
 
           <div>
             <h3 class="text-lg font-semibold mb-4">Holdings</h3>
-            <div class="space-y-3">
-              <div 
-                v-for="(holding, index) in selectedUser.holdings" 
-                :key="index"
-                class="flex items-center justify-between p-4 bg-accent rounded-lg"
-              >
+            <div v-if="selectedUser" class="space-y-3">
+              <div v-for="(holding, index) in selectedUser.holdings" :key="index"
+                class="flex items-center justify-between p-4 bg-accent rounded-lg">
                 <div class="flex items-center gap-3">
                   <Wallet class="h-4 w-4" />
-                  <span class="font-medium">{{ holding.symbol }}</span>
+                  <div>
+                    <span class="font-medium">{{ holding.symbol }}</span>
+                    <div class="text-sm text-gray-500">
+                      {{ holding.shares }} shares @ ${{ (holding.avgCost ?? 0).toFixed(2) }}
+                    </div>
+                  </div>
                 </div>
                 <div class="text-right">
-                  <div class="font-medium">${{ holding.value.toLocaleString() }}</div>
-                  <div class="text-sm text-green-600">+{{ holding.returns.toFixed(1) }}%</div>
+                  <div class="font-medium">${{ (holding.value ?? 0).toLocaleString() }}</div>
+                  <div class="text-sm" :class="(holding.returns ?? 0) >= 0 ? 'text-green-600' : 'text-red-600'">
+                    {{ (holding.returns ?? 0) >= 0 ? '+' : '' }}{{ (holding.returns ?? 0).toFixed(2) }}%
+                  </div>
                 </div>
               </div>
             </div>
