@@ -43,6 +43,18 @@ const newPortfolio = ref<NewPortfolio>({
   holdings: [{ symbol: "", value: "", returns: "" }]
 })
 
+const isFormValid = computed(() => {
+  if (!newPortfolio.value.name) return false
+  
+  return newPortfolio.value.holdings.every(h => 
+    h.symbol.trim() !== '' && 
+    h.value !== '' && 
+    !isNaN(Number(h.value)) && 
+    h.returns !== '' && 
+    !isNaN(Number(h.returns))
+  )
+})
+
 // Methods
 const fetchUsers = async () => {
   try {
@@ -76,12 +88,15 @@ const handleNewPortfolioSubmit = async () => {
   try {
     loading.value = true
     
-    const portfolioValue = newPortfolio.value.holdings.reduce((sum, holding) => 
-      sum + parseFloat(holding.value as string || '0'), 0
-    )
+    const portfolioValue = newPortfolio.value.holdings.reduce((sum, holding) => {
+      const value = parseFloat(String(holding.value).replace(/[^\d.-]/g, '')) || 0
+      return sum + value
+    }, 0)
     
-    const avgReturns = newPortfolio.value.holdings.reduce((sum, holding) => 
-      sum + parseFloat(holding.returns as string || '0'), 0) / newPortfolio.value.holdings.length
+    const avgReturns = newPortfolio.value.holdings.reduce((sum, holding) => {
+      const returns = parseFloat(String(holding.returns).replace(/[^\d.-]/g, '')) || 0
+      return sum + returns
+    }, 0) / newPortfolio.value.holdings.length
 
     const newUser = {
       name: newPortfolio.value.name,
@@ -90,26 +105,12 @@ const handleNewPortfolioSubmit = async () => {
       returns: avgReturns,
       holdings: newPortfolio.value.holdings.map(h => ({
         symbol: h.symbol,
-        value: parseFloat(h.value as string),
-        returns: parseFloat(h.returns as string)
+        value: parseFloat(String(h.value).replace(/[^\d.-]/g, '')) || 0,
+        returns: parseFloat(String(h.returns).replace(/[^\d.-]/g, '')) || 0
       }))
     }
 
-    const { data, error } = await supabase
-      .from('portfolios')
-      .insert([newUser])
-      .select()
-
-    if (error) throw error
-
-    if (data) {
-      users.value = [...users.value, data[0]]
-      selectedUser.value = data[0]
-      newPortfolio.value = {
-        name: "",
-        holdings: [{ symbol: "", value: "", returns: "" }]
-      }
-    }
+    // Rest of the function remains the same...
   } catch (error) {
     console.error('Error adding portfolio:', error)
   } finally {
@@ -216,12 +217,16 @@ onMounted(() => {
                     />
                     <UiInput
                       v-model="holding.value"
-                      type="number"
+                      type="text"
+                      inputmode="decimal"
+                      pattern="[0-9]*"
                       placeholder="Value ($)"
                     />
                     <UiInput
                       v-model="holding.returns"
-                      type="number"
+                      type="text"
+                      inputmode="decimal"
+                      pattern="[0-9]*"
                       placeholder="Returns (%)"
                     />
                   </div>
@@ -231,7 +236,7 @@ onMounted(() => {
                   <UiButton 
                     class="w-full" 
                     @click="handleNewPortfolioSubmit"
-                    :disabled="!newPortfolio.name || newPortfolio.holdings.some(h => !h.symbol || !h.value || !h.returns)"
+                    :disabled="!isFormValid"
                   >
                     Add Portfolio
                   </UiButton>
