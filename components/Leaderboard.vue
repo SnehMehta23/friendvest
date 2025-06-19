@@ -11,7 +11,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="i in 10" :key="i">
+          <tr v-for="i in 5" :key="i">
             <td class="py-1 text-gray-400">{{ i }}</td>
             <td>
               <div class="flex items-center space-x-2">
